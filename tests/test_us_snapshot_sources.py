@@ -9,11 +9,13 @@ elsewhere; the mocked gb_ payload below is a verbatim live response captured
 """
 
 import json
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+import requests
 
 from src.services.screening import snapshot as screening_snapshot
 from src.services.screening import snapshot_us
@@ -476,6 +478,113 @@ def test_us_source_guard_cooldown_skips_source(monkeypatch) -> None:
     )
     assert calls == ["sina_gb"]
     assert "temporarily disabled" in result.attrs["source_errors"][0]
+
+
+# --- US universe ------------------------------------------------------------
+
+_WIKI_SP500_HTML = (
+    "<table><thead><tr><th>Symbol</th><th>Security</th></tr></thead>"
+    "<tbody>"
+    "<tr><td>BRK.B</td><td>Berkshire Hathaway</td></tr>"
+    "<tr><td>AAPL</td><td>Apple Inc.</td></tr>"
+    "<tr><td>BF.B</td><td>Brown-Forman</td></tr>"
+    "</tbody></table>"
+)
+
+
+def _fake_requests_get_raises(exc: Exception):
+    def _get(url, **kwargs):
+        raise exc
+
+    return _get
+
+
+def test_fetch_sp500_tickers_parses_symbol_table(monkeypatch) -> None:
+    monkeypatch.setattr(
+        snapshot_us.requests, "get", _fake_requests_get(_WIKI_SP500_HTML),
+    )
+
+    tickers = snapshot_us._fetch_sp500_tickers()
+
+    # Dots are normalized to dashes (BRK.B -> BRK-B) and output is sorted.
+    assert tickers == ["AAPL", "BF-B", "BRK-B"]
+
+
+def test_fetch_sp500_tickers_wikipedia_403_raises(monkeypatch) -> None:
+    monkeypatch.setattr(
+        snapshot_us.requests, "get",
+        _fake_requests_get_raises(
+            requests.exceptions.HTTPError(
+                "403 Client Error: Forbidden for url: "
+                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            ),
+        ),
+    )
+
+    with pytest.raises(requests.exceptions.HTTPError, match="403"):
+        snapshot_us._fetch_sp500_tickers()
+
+
+def test_load_bundled_sp500_tickers() -> None:
+    tickers = snapshot_us._load_bundled_sp500_tickers()
+
+    assert len(tickers) == 503
+    assert tickers == sorted(tickers)
+    assert all(isinstance(t, str) and t for t in tickers)
+    assert "BRK-B" in tickers
+    assert "BF-B" in tickers
+
+
+def test_fetch_us_universe_auto_falls_back_to_bundled_on_wikipedia_403(
+    monkeypatch, caplog,
+) -> None:
+    monkeypatch.delenv("SCREENING_US_TICKERS", raising=False)
+    monkeypatch.setattr(
+        snapshot_us.requests, "get",
+        _fake_requests_get_raises(
+            requests.exceptions.HTTPError("403 Client Error: Forbidden"),
+        ),
+    )
+
+    with caplog.at_level(logging.WARNING, logger=snapshot_us.__name__):
+        tickers = snapshot_us.fetch_us_universe("auto")
+
+    assert tickers == snapshot_us._load_bundled_sp500_tickers()
+    assert len(tickers) == 503
+    # The silent fallback is now visible: sp500 (and env) failures warn.
+    assert "US universe source sp500 failed" in caplog.text
+    assert "US universe source env failed" in caplog.text
+
+
+def test_fetch_us_universe_env_wins_over_bundled(monkeypatch) -> None:
+    monkeypatch.setenv("SCREENING_US_TICKERS", "AAPL, MSFT")
+    monkeypatch.setattr(
+        snapshot_us.requests, "get",
+        _fake_requests_get_raises(
+            requests.exceptions.HTTPError("403 Client Error: Forbidden"),
+        ),
+    )
+
+    assert snapshot_us.fetch_us_universe("auto") == ["AAPL", "MSFT"]
+
+
+def test_fetch_us_universe_default_is_last_resort(monkeypatch) -> None:
+    monkeypatch.delenv("SCREENING_US_TICKERS", raising=False)
+    monkeypatch.setattr(
+        snapshot_us.requests, "get",
+        _fake_requests_get_raises(
+            requests.exceptions.HTTPError("403 Client Error: Forbidden"),
+        ),
+    )
+    monkeypatch.setattr(
+        snapshot_us, "_load_bundled_sp500_tickers",
+        lambda: (_ for _ in ()).throw(RuntimeError("bundled list missing")),
+    )
+
+    tickers = snapshot_us.fetch_us_universe("auto")
+
+    assert tickers == list(snapshot_us._DEFAULT_US_UNIVERSE)
+    assert len(tickers) == 49
 
 
 # --- Live Sina checks (network marker; skipped by the offline gate) ----------

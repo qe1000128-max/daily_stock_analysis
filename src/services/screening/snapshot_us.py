@@ -25,6 +25,7 @@ configuration path, so ``market="hk"`` is rejected at the pipeline level
 rather than silently screening the US pool.
 """
 
+import io
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import re
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -49,6 +51,12 @@ from src.services.screening.source_guard import (
 logger = logging.getLogger(__name__)
 
 _SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+_SP500_WIKI_TIMEOUT_SECONDS = 20
+
+# Bundled S&P 500 ticker list, extracted 2026-11-10 from the Wikipedia
+# "List of S&P 500 companies" page. Used when the live fetch fails and no
+# SCREENING_US_TICKERS override is set; refresh it when the index changes.
+_BUNDLED_SP500_PATH = Path(__file__).resolve().parent / "data" / "sp500_tickers.json"
 
 _DEFAULT_US_UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B",
@@ -110,19 +118,24 @@ def fetch_us_universe(source: str = "auto") -> list[str]:
     Sources:
         sp500   — scrape S&P 500 from Wikipedia
         env     — read SCREENING_US_TICKERS (comma-separated)
+        bundled — S&P 500 list bundled with the repo
+                  (``data/sp500_tickers.json``, extracted 2026-11-10)
         default — hardcoded top-50 US large-caps
-        auto    — try sp500 → env → default
+        auto    — try sp500 → env → bundled → default
+
+    ``auto`` logs each failed source at WARNING level so a silent
+    fallback to a smaller list is visible in the logs.
     """
     src = source.lower()
     if src == "auto":
-        for s in ("sp500", "env", "default"):
+        for s in ("sp500", "env", "bundled", "default"):
             try:
                 tickers = fetch_us_universe(s)
                 if tickers:
                     logger.info("US universe from %s: %d tickers", s, len(tickers))
                     return tickers
             except Exception as e:
-                logger.debug("US universe source %s failed: %s", s, e)
+                logger.warning("US universe source %s failed: %s", s, e)
         return list(_DEFAULT_US_UNIVERSE)
 
     if src == "sp500":
@@ -132,6 +145,8 @@ def fetch_us_universe(source: str = "auto") -> list[str]:
         if not raw:
             raise ValueError("SCREENING_US_TICKERS not set")
         return [t.strip() for t in raw.split(",") if t.strip()]
+    elif src == "bundled":
+        return _load_bundled_sp500_tickers()
     elif src == "default":
         return list(_DEFAULT_US_UNIVERSE)
     else:
@@ -139,11 +154,46 @@ def fetch_us_universe(source: str = "auto") -> list[str]:
 
 
 def _fetch_sp500_tickers() -> list[str]:
-    tables = pd.read_html(_SP500_WIKI_URL)
+    """Fetch the S&P 500 ticker list from Wikipedia.
+
+    Wikipedia 403s plain ``pd.read_html`` calls (no User-Agent), so the
+    page is fetched first with a browser User-Agent and parsed from the
+    returned HTML. ``pd.read_html`` takes a file-like object here because
+    passing a literal HTML string is deprecated in pandas.
+    """
+    resp = requests.get(
+        _SP500_WIKI_URL,
+        headers={"User-Agent": _BROWSER_USER_AGENT},
+        timeout=_SP500_WIKI_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    tables = pd.read_html(io.StringIO(resp.text))
     for tbl in tables:
         if "Symbol" in tbl.columns:
             return sorted(tbl["Symbol"].dropna().str.strip().str.replace(".", "-", regex=False).tolist())
     raise RuntimeError("Could not find Symbol column in S&P 500 Wikipedia table")
+
+
+def _load_bundled_sp500_tickers() -> list[str]:
+    """Load the bundled S&P 500 ticker list shipped with the repo.
+
+    The list lives at ``src/services/screening/data/sp500_tickers.json``
+    (extracted 2026-11-10 from the Wikipedia "List of S&P 500 companies"
+    page) and is the fallback when the live Wikipedia fetch fails.
+    """
+    try:
+        data = json.loads(_BUNDLED_SP500_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Bundled S&P 500 list not found: {_BUNDLED_SP500_PATH}"
+        ) from None
+    if not isinstance(data, list) or not data or not all(
+        isinstance(t, str) and t.strip() for t in data
+    ):
+        raise RuntimeError(
+            f"Bundled S&P 500 list is malformed: {_BUNDLED_SP500_PATH}"
+        )
+    return sorted(t.strip() for t in data)
 
 
 def fetch_us_snapshot(
