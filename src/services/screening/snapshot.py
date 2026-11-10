@@ -158,15 +158,112 @@ def fetch_snapshot_with_fallback(
 
 def _fetch_us_snapshot_with_fallback(
     required_columns: list[str] | None = None,
+    sources: list[str] | None = None,
+    fallback_snapshot_path: str | Path | None = None,
+    fallback_max_age_hours: float | None = None,
 ) -> pd.DataFrame:
-    """Fetch US equity snapshot via yfinance adapter."""
-    from src.services.screening.snapshot_us import fetch_us_snapshot
+    """Fetch US equity snapshot, trying sources in priority order.
 
-    df = fetch_us_snapshot()
-    missing = _missing_required_columns(df, required_columns or [])
-    if missing:
-        logger.warning("US snapshot missing columns: %s", ",".join(missing))
-    return df
+    Mirrors the CN :func:`fetch_snapshot_with_fallback` loop: each source
+    is tried under the caller-side timeout wrapper with required-column
+    gating and per-source guard recording (guard keys are namespaced as
+    ``us_<source>`` so US failures never cool down the CN source of the
+    same name — the two hit different endpoints). When every live source
+    fails, the last-good US snapshot cache is used. The cache path
+    defaults to ``data/snapshot_us.last_good.json`` (separate from the CN
+    cache) and can be overridden with
+    ``SCREENING_US_FALLBACK_SNAPSHOT_PATH``.
+
+    Note: the pipeline's ``cache_ttl_seconds`` fresh-cache path is not
+    wired here yet — :func:`fetch_snapshot_with_fallback` routes
+    ``market="us"`` straight to this function without passing its cache
+    arguments, so a fresh-cache reuse for US needs a one-line call-site
+    change there.
+    """
+    from functools import partial
+
+    from src.services.screening.snapshot_us import (
+        fetch_us_snapshot_source,
+        resolve_us_snapshot_source_priority,
+    )
+
+    priority = list(sources) if sources else resolve_us_snapshot_source_priority()
+    required = required_columns or []
+    cache_path = (
+        Path(fallback_snapshot_path)
+        if fallback_snapshot_path is not None
+        else _us_fallback_snapshot_path()
+    )
+    errors: list[str] = []
+    # US sources need a longer caller-side budget than the CN 60 s
+    # default: the Tencent/Sina paths fetch quotes and then enrich
+    # volume_ratio from one full-history K-line series per ticker
+    # (~1 MB each; ~125 MB for the whole S&P 500).
+    timeout_sec = parse_source_timeout_seconds(
+        "SCREENING_US_SNAPSHOT_CALL_TIMEOUT_SEC",
+        default=180.0,
+    )
+
+    for source in priority:
+        guard_source = f"us_{source}"
+        disabled_reason = _source_disabled_reason(guard_source)
+        if disabled_reason:
+            errors.append(f"{source}: {disabled_reason}")
+            continue
+        try:
+            df = call_with_timeout(
+                partial(fetch_us_snapshot_source, source),
+                timeout_sec=timeout_sec,
+                label=f"US snapshot source {source}",
+            )
+            if not df.empty:
+                missing = _missing_required_columns(df, required)
+                if missing:
+                    error = f"missing required columns {','.join(missing)}"
+                    errors.append(f"{source}: {error}")
+                    _record_source_failure(guard_source, error)
+                    continue
+                df.attrs.setdefault("snapshot_source", source)
+                df.attrs["source_errors"] = list(errors)
+                df.attrs["fallback_used"] = False
+                df.attrs["stale"] = False
+                df.attrs["stale_age_hours"] = None
+                _write_last_good_snapshot(
+                    cache_path,
+                    df,
+                    source_priority=priority,
+                )
+                _record_source_success(guard_source, rows=len(df))
+                logger.info("US snapshot fetched from %s: %d rows", source, len(df))
+                return df
+            errors.append(f"{source}: returned empty data")
+            _record_source_failure(guard_source, "returned empty data")
+        except Exception as e:
+            errors.append(f"{source}: {e}")
+            _record_source_failure(guard_source, e)
+            logger.warning("US snapshot source %s failed: %s", source, e)
+
+    cached = _read_last_good_snapshot(
+        cache_path,
+        required_columns=required,
+        source_errors=errors,
+        max_age_hours=fallback_max_age_hours,
+    )
+    if cached is not None:
+        return cached
+
+    raise RuntimeError(f"All US snapshot sources failed: {'; '.join(errors)}")
+
+
+def _us_fallback_snapshot_path() -> Path:
+    """Return the last-good cache path for US snapshots."""
+    explicit = os.getenv("SCREENING_US_FALLBACK_SNAPSHOT_PATH", "").strip()
+    if explicit:
+        return Path(explicit)
+    data_dir = os.getenv("SCREENING_DATA_DIR", "").strip()
+    if data_dir:
+        return Path(data_dir) / "snapshot_us.last_good.json"
+    return Path(__file__).resolve().parents[3] / "data" / "snapshot_us.last_good.json"
 
 
 def _missing_required_columns(df: pd.DataFrame, required_columns: list[str]) -> list[str]:

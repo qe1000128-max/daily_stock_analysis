@@ -30,6 +30,13 @@ DEFAULT_LLM_MODEL = "gemini/gemini-3.6-flash"
 # required column natively, including volume_ratio, which sina lacks.
 # The previous sources keep their relative order as fallback.
 DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["tencent", "sina", "efinance", "akshare_em", "em_datacenter"]
+# US snapshot source chain. "tencent" is first: Tencent US batch quotes
+# (qt.gtimg.cn q=usXXX, 71 fields) supply price, change, amount, market
+# caps, PE, PB and turnover natively; volume_ratio is enriched from Sina
+# US daily K-lines. "sina_gb" is second (Sina gb_ quotes: price, change,
+# volume, market cap and PE only — no amount, PB, turnover or shares, so
+# it cannot serve strategies requiring those columns). "yfinance" is last.
+DEFAULT_US_SNAPSHOT_SOURCE_PRIORITY = ["tencent", "sina_gb", "yfinance"]
 TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "sina", "efinance", "akshare_em", "em_datacenter"]
 _ENV_FILE_CACHE: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 _APPLIED_ENV_FILE_VALUES: dict[str, str] = {}
@@ -140,6 +147,14 @@ def _resolve_snapshot_source_priority() -> list[str]:
     return list(DEFAULT_SNAPSHOT_SOURCE_PRIORITY)
 
 
+def resolve_us_snapshot_source_priority() -> list[str]:
+    """Return the US snapshot source chain, honouring the env override."""
+    explicit = os.getenv("SCREENING_US_SNAPSHOT_SOURCE_PRIORITY")
+    if explicit is not None:
+        return [s.strip() for s in explicit.split(",") if s.strip()]
+    return list(DEFAULT_US_SNAPSHOT_SOURCE_PRIORITY)
+
+
 def _resolve_fallback_snapshot_path(data_dir: Path) -> Path | None:
     for name in ("SCREENING_FALLBACK_SNAPSHOT_PATH", "FALLBACK_SNAPSHOT_PATH"):
         raw = os.getenv(name)
@@ -195,6 +210,10 @@ class Config:
     # Snapshot data source priority
     snapshot_source_priority: list[str] = field(
         default_factory=lambda: list(DEFAULT_SNAPSHOT_SOURCE_PRIORITY)
+    )
+    # US snapshot data source priority (tencent, sina_gb, yfinance).
+    us_snapshot_source_priority: list[str] = field(
+        default_factory=resolve_us_snapshot_source_priority
     )
     fallback_snapshot_path: Path | None = (
         _PROJECT_ROOT / "data" / "snapshot.last_good.json"
@@ -327,6 +346,7 @@ class Config:
             llm_timeout_sec=max(1.0, _parse_float_env("LLM_TIMEOUT_SEC", 60.0)),
             llm_max_tokens=max(1, int(os.getenv("LLM_MAX_TOKENS", "2048"))),
             snapshot_source_priority=_resolve_snapshot_source_priority(),
+            us_snapshot_source_priority=resolve_us_snapshot_source_priority(),
             fallback_snapshot_path=fallback_snapshot_path,
             snapshot_cache_ttl_seconds=max(
                 0.0,

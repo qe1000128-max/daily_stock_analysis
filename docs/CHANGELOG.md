@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - [改进] Agent 轨迹评估增加独立股票范围诊断与干扰股票样例，区分越界请求、运行时拦截和无法判定调用，支持多股对比及阶段明细，不改变原指标或退出码。
 - [新功能] A 股选股快照新增 Tencent 实时行情源（`qt.gtimg.cn`，无 key），默认链首选：全市场代码宇宙取自通达信官方日线包（`tdx.com.cn`，按交易日回溯），分块并行拉取实时行情并直供 `volume_ratio` / `turnover_rate` 等全部必需列；Tencent 不可用时按既有顺序降级到 Sina → Efinance → AkShare 东财 → 东财数据中心，显式 `SNAPSHOT_SOURCE_PRIORITY` 与 Tushare 优先逻辑不变；僵尸代码（成交额为 0 且现价等于昨收）按 stale 丢弃。
+- [新功能] 美股选股快照新增多源降级链（默认 tencent → sina_gb → yfinance）：Tencent 美股批量行情（`qt.gtimg.cn`，无 key）为主源，量比由新浪美股日 K 补算（最近 21 根，当日量 / 前 20 根均量，仅对报价有效标的拉取）；新浪 `gb_` 批量行情作备用，yfinance 保留为最后兜底；美股 last-good 缓存与 A 股分开存放，来源健康记录键为 `us_<来源>`；`SCREENING_US_SNAPSHOT_SOURCE_PRIORITY` 可显式覆盖。Tencent 美股路径尚未在线验证（本机限流，需 Codespace 实测）。
+- [新功能] 选股新增可选富化层（`src/services/screening/enrichment.py`，默认不接入管线）：A 股行业/概念取自东财 push2 `clist` 串行分页（间隔 ≥1s，日缓存），A 股基本面按入选短名单逐只取东财数据中心财报（≤20 只），美股基本面取 SEC EDGAR frames（需 `EDGAR_USER_AGENT` 环境变量）；富化失败只留空/None，永不阻断筛股；详见 `docs/screening-enrichment.md`。
 
 ## [3.33.0] - 2026-10-15
 

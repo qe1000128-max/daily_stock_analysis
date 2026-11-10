@@ -102,6 +102,8 @@ SCREENING_EASTMONEY_JITTER_SEC=0.3
 
 - 全市场快照在短 TTL 内优先复用最近成功结果；新缓存会记录完整且有序的数据源优先级，只在当前优先级与写入时一致时复用，因此同一来源链中的后备源结果可以加速后续请求，修改来源配置后则会重新读取实时数据。缓存过期后按配置优先级逐源尝试，单一数据源失败后继续降级，并记录 source health 与 last-good 缓存。当前 Tencent、Sina、Efinance、AkShare/东财和 Tushare 快照接口均不提供增量游标或变更序列，因此 TTL 内可以零请求复用，TTL 到期后仍需重新读取全表；本地比较前后差异不能减少上游传输量，不作为“增量拉取”宣传。
 - 有 `TUSHARE_TOKEN` 时默认优先 Tushare，否则默认从 Tencent（`qt.gtimg.cn` 实时行情，全市场代码宇宙取自通达信官方日线包）开始，依次为 Tencent → Sina → Efinance → AkShare 东财 → 东财数据中心；显式 `SNAPSHOT_SOURCE_PRIORITY` 始终优先。
+- 美股快照来源链：默认 Tencent（`qt.gtimg.cn` 批量行情，`us` 前缀）→ 新浪 `gb_` 批量行情 → yfinance；显式 `SCREENING_US_SNAPSHOT_SOURCE_PRIORITY` 始终优先。量比由新浪美股日 K 补算（取最近 21 根，当日量 / 前 20 根均量），只对报价有效的标的拉取，`SCREENING_US_VOLUME_RATIO_MAX_TICKERS` 默认 500；新浪 `gb_` 无成交额/PB/换手率/量比，不能满足要求这些列的策略，会继续降级到 yfinance。美股 last-good 缓存与 A 股分开存放（`data/snapshot_us.last_good.json`），来源健康记录键为 `us_<来源>`，与 A 股互不干扰。Tencent 美股路径尚未在线验证（本机限流，需 Codespace 实测）。
+- 可选富化层（`src/services/screening/enrichment.py`，默认不接入管线）：A 股行业/概念取自东财 push2 `clist` 串行分页（间隔 ≥1s，日缓存于 `data/industry_provider_cache/`），A 股基本面按入选短名单逐只取东财数据中心财报（≤20 只），美股基本面取 SEC EDGAR frames（需 `EDGAR_USER_AGENT` 环境变量，真实姓名+邮箱）。富化失败只留空/None，永不阻断筛股；详见 `docs/screening-enrichment.md`。
 - 日 K 优先通过请求级 fetcher 复用 DSA 历史行情链路，无结果时再走筛选引擎的数据源降级；该桥接不会替换进程级函数，因此重叠选股请求之间不会共享 wrapper 或阻塞彼此。
 - 存在可用的 LLM 配置时，重排前对快照评分前 3 个候选补充 DSA 行情、基本面、新闻与事件（每类搜索最多 3 条），让事件风险可以进入既有 LLM `risk/risk_flags` 与后续风险评分。仅因子排序时继续使用 `pre_rank_light`，新闻和事件仍在名单确定后获取；不新增关键词否决或风险阈值。
 - 提示词中的新闻/事件证据包含有界标题、摘要、来源、链接，并保留已有的原始发布时间与检索时间；搜索适配器将上游结果的 `retrieved_at` 原样传递至排序、最终响应与运行历史，缺少时间字段时保持未知，不使用适配或缓存读取时刻补造检索时间。真实搜索结果模型包含可空 `retrieved_at`：供应商实际查询成功时记录 UTC 检索完成时间，后续日期归一化、过滤、相关性排序及缓存复用均保留原值；已有时间不会覆盖，旧结果缺少时间仍为未知。检索时间不代表事件发生或发布的时间。未采集、无结果、查询失败都不代表已排除风险，模型应区分证据覆盖差异与真实风险。已有提示词长度预算仍可能压缩证据，并记录裁剪说明。
@@ -126,8 +128,9 @@ Web 会在浏览器本地生成一个不含用户信息的匿名种子，并随�
 | 数据 | 位置 | 有效期/行为 |
 | --- | --- | --- |
 | 全市场快照 | `data/screening/snapshot.last_good.json` | 默认 5 分钟内直接复用且不标记 fallback；过期后请求实时源，实时源全部失败时仍可按最大陈旧时间约束回退并标记 stale/fallback |
+| 美股快照 | `data/snapshot_us.last_good.json` | 与 A 股缓存分开存放；实时源全部失败时回退并标记 stale/fallback |
 | 个股日 K | `data/screening/daily_history/` | 按代码、来源和回看窗口分键，默认 TTL 24 小时，并核验最新已收盘交易日及缓存获取时段；刷新失败时可使用旧数据并标记 stale |
-| 行业/概念映射 | `data/screening/industry_provider_cache/` | 默认 TTL 24 小时，并保存板块热度历史用于趋势计算 |
+| 行业/概念映射 | `data/screening/industry_provider_cache/` | 默认 TTL 24 小时，并保存板块热度历史用于趋势计算；东财 `clist` 日映射（`eastmoney_clist_map_v1.json`）也存于此目录 |
 | 热点列表与历史 | `data/screening/hotspots.json`、`hotspot.history.jsonl` | 显式刷新写入；实时失败时回退最近可用快照 |
 | 热点详情 | `data/screening/hotspot_details/` | 默认 TTL 30 分钟；只缓存结构化基础详情，显式消息搜索不写入或续期该缓存；实时失败时可回退过期详情并返回陈旧时长 |
 | DSA 实时行情 | `DataFetcherManager` 的行情缓存 | 默认 TTL 10 分钟，沿用 `REALTIME_CACHE_TTL` |
