@@ -7,12 +7,16 @@ Fetches full-market real-time snapshots for screening.
 This is separate from single-stock realtime quotes.
 """
 
+import io
 import logging
 import json
 import os
 import random
 import threading
 import time
+import urllib.request
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
@@ -37,6 +41,21 @@ _EM_LAST_REQUEST_AT = 0.0
 _EM_LOCK = threading.Lock()
 _SOURCE_HEALTH: dict[str, dict[str, object]] = {}
 _SOURCE_HEALTH_LOCK = threading.Lock()
+# Tencent quote source (a-stock-data §1.1 quote + §1.3 TDX code table).
+_TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
+_TDX_ZIP_URL_TEMPLATE = "https://www.tdx.com.cn/products/data/data/g4day/{date}.zip"
+_TDX_ZIP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+_TENCENT_CHUNK_SIZE = 500
+# 3 workers, not more: qt.gtimg.cn throttles bursts from one egress IP
+# (6-way parallel worked once, then every chunk timed out), and 3-way
+# still fetches the whole market in ~12 s.
+_TENCENT_MAX_WORKERS = 3
+_TENCENT_TIMEOUT_SECONDS = 20
+_TDX_ZIP_LOOKBACK_DAYS = 10
+_TDX_UNIVERSE_CACHE: dict[str, list[str]] = {}
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -50,6 +69,8 @@ def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
     """
     if source == "sina":
         return _call_snapshot_wrapper(_fetch_sina, source=source)
+    elif source == "tencent":
+        return _call_snapshot_wrapper(_fetch_tencent, source=source)
     elif source == "efinance":
         return _call_snapshot_wrapper(_fetch_efinance, source=source)
     elif source == "akshare_em":
@@ -402,6 +423,198 @@ def _parse_created_at(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _fetch_tencent() -> pd.DataFrame:
+    """Fetch A-share full-market snapshot via Tencent real-time quotes.
+
+    Data paths from simonlin1212/a-stock-data (SKILL.md v3.10.4, Apache-2.0):
+    the code universe comes from the latest Tongdaxin EOD package code table
+    (§1.3, one 2.7 MB zip per trading day, no key), and quotes come from
+    Tencent qt.gtimg.cn (§1.1, no key), which supplies price, change,
+    amount, turnover, PE (TTM), PB, market caps and volume_ratio natively.
+    No raw volume field exists in the Tencent quote; industry/concepts are
+    not supplied (the pipeline enriches those separately).
+    """
+    codes = _tdx_a_share_universe()
+    if not codes:
+        raise RuntimeError("tencent: empty A-share universe from TDX code table")
+    rows, dropped_stale = _tencent_quotes(codes)
+    if not rows:
+        raise RuntimeError("tencent returned empty data")
+    logger.info(
+        "tencent: %d rows from %d codes (%d stale quotes dropped)",
+        len(rows), len(codes), dropped_stale,
+    )
+    return _normalize(pd.DataFrame(rows), source="tencent")
+
+
+def _tencent_quotes(codes: list[str]) -> tuple[list[dict], int]:
+    """Fetch Tencent quotes for prefixed codes, in parallel chunks."""
+    chunks = [
+        codes[i:i + _TENCENT_CHUNK_SIZE]
+        for i in range(0, len(codes), _TENCENT_CHUNK_SIZE)
+    ]
+    rows: list[dict] = []
+    dropped_stale = 0
+    with ThreadPoolExecutor(max_workers=_TENCENT_MAX_WORKERS) as pool:
+        for chunk_rows, chunk_stale in pool.map(_tencent_quote_chunk, chunks):
+            rows.extend(chunk_rows)
+            dropped_stale += chunk_stale
+    return rows, dropped_stale
+
+
+def _tencent_quote_chunk(prefixed: list[str]) -> tuple[list[dict], int]:
+    """Fetch one Tencent quote chunk and parse it into snapshot rows.
+
+    Field indices follow a-stock-data §1.1 (calibrated 2026-05-03).
+    Units are the traps: amount is in 万元, market caps in 亿元, and
+    index 44 is the *float* (circulation) market cap while index 45 is
+    the *total* market cap (reversed in many online tutorials).
+    Retries transient read timeouts: one slow chunk must not fail the
+    whole-market fetch.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            return _tencent_quote_chunk_once(prefixed)
+        except Exception as exc:  # noqa: BLE001 - retry, then fail the source.
+            last_exc = exc
+            logger.warning(
+                "tencent chunk attempt %d/%d failed (%d codes): %s",
+                attempt + 1, 3, len(prefixed), exc,
+            )
+            time.sleep(1.0 * (attempt + 1))
+    raise RuntimeError(f"tencent chunk failed after 3 attempts: {last_exc}")
+
+
+def _tencent_quote_chunk_once(prefixed: list[str]) -> tuple[list[dict], int]:
+    url = _TENCENT_QUOTE_URL + ",".join(prefixed)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=_TENCENT_TIMEOUT_SECONDS) as resp:
+        text = resp.read().decode("gbk")
+    rows: list[dict] = []
+    stale = 0
+    for line in text.strip().split(";"):
+        line = line.strip()
+        if not line or "=" not in line or '"' not in line:
+            continue
+        key = line.split("=", 1)[0].split("_")[-1]
+        vals = line.split('"')[1].split("~")
+        if len(vals) < 53:
+            continue
+        try:
+            price = float(vals[3] or 0)
+            last_close = float(vals[4] or 0)
+            amount_wan = float(vals[37] or 0)
+        except ValueError:
+            continue
+        # Stale-quote guard from a-stock-data §1.1: a zero-amount quote
+        # frozen at last close is a suspended stock or a migrated old
+        # Beijing code returning zombie data. Drop it.
+        if amount_wan == 0 and price == last_close and price > 0:
+            stale += 1
+            continue
+        code = key[2:] if len(key) > 2 else key
+        if len(code) != 6 or not code.isdigit():
+            continue
+        try:
+            rows.append({
+                "code": code,
+                "name": vals[1],
+                "price": price,
+                "change_pct": float(vals[32] or 0),
+                "amount": amount_wan * 10000,
+                "total_mv": float(vals[45] or 0) * 1e8,
+                "circ_mv": float(vals[44] or 0) * 1e8,
+                "pe_ratio": float(vals[39] or 0),
+                "pb_ratio": float(vals[46] or 0),
+                "volume_ratio": float(vals[49] or 0),
+                "turnover_rate": float(vals[38] or 0),
+            })
+        except ValueError:
+            continue
+    return rows, stale
+
+
+def _tdx_a_share_universe() -> list[str]:
+    """A-share code list (market-prefixed) from the latest TDX EOD package.
+
+    Walks back calendar days on 404 (package unpublished yet, non-trading
+    day, or before the retention window). The code list barely changes day
+    to day, so a one-day-old package is fine for the universe; the quotes
+    themselves are always live from Tencent. Results are cached per
+    package date for the life of the process.
+    """
+    today = date.today()
+    for back in range(_TDX_ZIP_LOOKBACK_DAYS + 1):
+        day = today - timedelta(days=back)
+        key = day.strftime("%Y%m%d")
+        if key in _TDX_UNIVERSE_CACHE:
+            return list(_TDX_UNIVERSE_CACHE[key])
+        try:
+            codes = _fetch_tdx_universe_for_date(key)
+        except Exception as exc:  # noqa: BLE001 - try the previous trading day.
+            logger.debug("TDX package %s unavailable: %s", key, exc)
+            continue
+        _TDX_UNIVERSE_CACHE[key] = codes
+        logger.info("TDX universe from package %s: %d A-share codes", key, len(codes))
+        return list(codes)
+    raise RuntimeError("tencent: no TDX EOD package available in lookback window")
+
+
+def _fetch_tdx_universe_for_date(date_str: str) -> list[str]:
+    """Parse one TDX EOD package code table into prefixed A-share codes.
+
+    Zip members are {market}{YYMMDD}.cod (150 bytes/record: [0:6] ASCII
+    code, [32:34] seq, [40:72] GBK name) plus matching .md1 quote blocks.
+    Only the code table is needed here; only A-share stocks are kept
+    (SH 60/68, SZ 00/30, BJ 92), mirroring the em_datacenter market
+    filter (main boards, ChiNext, STAR, Beijing).
+    """
+    url = _TDX_ZIP_URL_TEMPLATE.format(date=date_str)
+    resp = requests.get(
+        url,
+        headers={"User-Agent": _TDX_ZIP_USER_AGENT},
+        timeout=(10, 60),
+    )
+    if resp.status_code == 404:
+        raise RuntimeError(f"TDX package {date_str} not published (404)")
+    resp.raise_for_status()
+    content = resp.content
+    if content[:2] != b"PK":
+        raise RuntimeError(f"TDX package {date_str} is not a zip")
+    yymmdd = date_str[2:]
+    codes: list[str] = []
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        for market in ("sh", "sz", "bj"):
+            try:
+                cod = zf.read(f"{market}{yymmdd}.cod")
+            except KeyError:
+                continue
+            if len(cod) % 150 != 0:
+                raise RuntimeError(
+                    f"TDX {market}{yymmdd}.cod length not a multiple of 150"
+                )
+            for i in range(len(cod) // 150):
+                code = cod[i * 150:(i + 1) * 150][0:6].decode("ascii", errors="ignore")
+                if _is_a_share_code(market, code):
+                    codes.append(f"{market}{code}")
+    if not codes:
+        raise RuntimeError(f"TDX package {date_str} yielded no A-share codes")
+    return codes
+
+
+def _is_a_share_code(market: str, code: str) -> bool:
+    if len(code) != 6 or not code.isdigit():
+        return False
+    if market == "sh":
+        return code.startswith(("60", "68"))
+    if market == "sz":
+        return code.startswith(("00", "30"))
+    if market == "bj":
+        return code.startswith("92")
+    return False
+
+
 def _fetch_efinance() -> pd.DataFrame:
     """Fetch via efinance."""
     import efinance as ef
@@ -733,6 +946,22 @@ def _normalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
             "pe_ratio": ["per"],
             "pb_ratio": ["pb"],
             "turnover_rate": ["turnoverratio"],
+        }
+    elif source == "tencent":
+        # Rows are built with standard column names already (units converted
+        # in _tencent_quote_chunk: amount 万元->元, market caps 亿元->元).
+        standard_cols = {
+            "code": ["code"],
+            "name": ["name"],
+            "price": ["price"],
+            "change_pct": ["change_pct"],
+            "amount": ["amount"],
+            "total_mv": ["total_mv"],
+            "circ_mv": ["circ_mv"],
+            "pe_ratio": ["pe_ratio"],
+            "pb_ratio": ["pb_ratio"],
+            "volume_ratio": ["volume_ratio"],
+            "turnover_rate": ["turnover_rate"],
         }
     elif source == "em_datacenter":
         standard_cols = {

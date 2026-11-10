@@ -25,7 +25,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_POST_ANALYZERS = ["scorecard"]
 DEFAULT_LLM_MODEL = "gemini/gemini-3.6-flash"
-DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["sina", "efinance", "akshare_em", "em_datacenter"]
+# Snapshot source chain. "tencent" is first: Tencent real-time quotes
+# (universe from the Tongdaxin EOD package code table) supply every
+# required column natively, including volume_ratio, which sina lacks.
+# The previous sources keep their relative order as fallback.
+DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["tencent", "sina", "efinance", "akshare_em", "em_datacenter"]
 TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "sina", "efinance", "akshare_em", "em_datacenter"]
 _ENV_FILE_CACHE: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 _APPLIED_ENV_FILE_VALUES: dict[str, str] = {}
